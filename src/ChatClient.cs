@@ -53,7 +53,12 @@ public sealed class ChatClient : IDisposable
         };
         var request = new { model = _config.Model, temperature = 0, max_tokens = 180, response_format = new { type = "json_object" }, messages = new[] { new { role = "system", content = systemPrompt }, new { role = "user", content = DecisionProtocol.BuildUserJson(decision) } } };
         using HttpResponseMessage response = await _http.PostAsync(_config.ChatCompletionsUrl, new StringContent(JsonSerializer.Serialize(request), Encoding.UTF8, "application/json"), cancellationToken);
-        if (!response.IsSuccessStatusCode) return null;
+        if (!response.IsSuccessStatusCode)
+        {
+            string body = await response.Content.ReadAsStringAsync(cancellationToken);
+            if (body.Length > 500) body = body[..500];
+            throw new HttpRequestException($"LLM returned HTTP {(int)response.StatusCode}: {body}", null, response.StatusCode);
+        }
         using JsonDocument document = JsonDocument.Parse(await response.Content.ReadAsStreamAsync(cancellationToken));
         return document.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
     }
