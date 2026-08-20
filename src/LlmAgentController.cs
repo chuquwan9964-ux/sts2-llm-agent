@@ -128,11 +128,16 @@ public sealed class LlmAgentController : Node
 
     private Decision? BuildDecision(RunState run)
     {
+        NRun? runNode = NGame.Instance?.CurrentRunNode;
+        if (runNode is not null && NMapScreen.Instance?.IsOpen == true)
+        {
+            Decision? mapDecision = MapDecision(runNode, run);
+            if (mapDecision is not null) return mapDecision;
+        }
         if (NOverlayStack.Instance?.Peek() is Node overlay) return OverlayDecision(overlay);
         if (CombatManager.Instance.IsInProgress) return CombatDecision(run);
-        NGame? game = NGame.Instance;
-        if (game?.CurrentRunNode is null) return null;
-        return RoomDecision(game.CurrentRunNode, run) ?? MapDecision(game.CurrentRunNode, run);
+        if (runNode is null) return null;
+        return RoomDecision(runNode, run) ?? MapDecision(runNode, run);
     }
 
     private Decision? CombatDecision(RunState run)
@@ -321,10 +326,22 @@ public sealed class LlmAgentController : Node
 
     private Decision? MapDecision(NRun runNode, RunState run)
     {
-        if (!runNode.GlobalUi.MapScreen.IsVisibleInTree()) return null;
-        List<NMapPoint> points = UiHelper.FindAll<NMapPoint>(runNode.GlobalUi.MapScreen).Where(p => p.IsEnabled).ToList();
-        return new("map", new { floor = run.TotalFloor, visited = run.VisitedMapCoords.Count }, points.Select((p, i) => new AgentAction("m" + i, "map_path", $"Go to row {p.Point.coord.row}, column {p.Point.coord.col}")).ToList());
+        if (NMapScreen.Instance?.IsOpen != true || !runNode.GlobalUi.MapScreen.IsVisibleInTree()) return null;
+        List<NMapPoint> points = GetEnabledMapPoints(runNode);
+        return points.Count == 0 ? null : new("map", new
+        {
+            floor = run.TotalFloor,
+            actFloor = run.ActFloor,
+            current = run.CurrentMapCoord?.ToString(),
+            visited = run.VisitedMapCoords.Count
+        }, points.Select((p, i) => new AgentAction("m" + i, "map_path", $"Choose {p.Point.PointType} at row {p.Point.coord.row}, column {p.Point.coord.col}")).ToList());
     }
+
+    private static List<NMapPoint> GetEnabledMapPoints(NRun runNode) => UiHelper.FindAll<NMapPoint>(runNode.GlobalUi.MapScreen)
+        .Where(point => point.IsEnabled && point.IsVisibleInTree())
+        .OrderBy(point => point.Point.coord.row)
+        .ThenBy(point => point.Point.coord.col)
+        .ToList();
 
     private Decision? RoomDecision(NRun runNode, RunState run)
     {
@@ -417,11 +434,11 @@ public sealed class LlmAgentController : Node
         AgentAction? liveAction = liveDecision?.Screen == screen ? liveDecision.Actions.SingleOrDefault(candidate => candidate.Id == action.Id && candidate.Kind == action.Kind) : null;
         if (liveAction is null) return;
         if (screen == "combat") { await ExecuteCombat(liveAction); return; }
-        if (NOverlayStack.Instance?.Peek() is Node overlay) { ExecuteOverlay(overlay, liveAction); return; }
         NRun? run = NGame.Instance?.CurrentRunNode;
         if (run is null) return;
         action = liveAction;
-        if (screen == "map") { var points = UiHelper.FindAll<NMapPoint>(run.GlobalUi.MapScreen).Where(p => p.IsEnabled).ToList(); int i = Index(action.Id); if (i >= 0 && i < points.Count) await UiHelper.Click(points[i]); return; }
+        if (screen == "map") { var points = GetEnabledMapPoints(run); int i = Index(action.Id); if (i >= 0 && i < points.Count) await UiHelper.Click(points[i]); return; }
+        if (NOverlayStack.Instance?.Peek() is Node overlay) { ExecuteOverlay(overlay, liveAction); return; }
         Node room = run.GetNode("RoomContainer"); int index = Index(action.Id);
         if (screen == "event") { var items = UiHelper.FindAll<NEventOptionButton>(room).Where(o => o.IsEnabled && !o.Option.IsLocked).ToList(); if (index >= 0 && index < items.Count) await UiHelper.Click(items[index]); }
         else if (screen == "rest_site") { var rest = room.GetNodeOrNull<NRestSiteRoom>("RestSiteRoom"); if (action.Kind == "proceed" && rest?.ProceedButton.IsEnabled == true) await UiHelper.Click(rest.ProceedButton); else { var items = UiHelper.FindAll<NRestSiteButton>(room).Where(b => b.Option.IsEnabled).ToList(); if (index >= 0 && index < items.Count) await UiHelper.Click(items[index]); } }
