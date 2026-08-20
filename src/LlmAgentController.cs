@@ -5,10 +5,13 @@ using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Commands;
 using MegaCrit.Sts2.Core.Context;
 using MegaCrit.Sts2.Core.Entities.Cards;
+using MegaCrit.Sts2.Core.Entities.CardRewardAlternatives;
 using MegaCrit.Sts2.Core.Entities.Creatures;
+using MegaCrit.Sts2.Core.Entities.Merchant;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Entities.Potions;
 using MegaCrit.Sts2.Core.GameActions.Multiplayer;
+using MegaCrit.Sts2.Core.Localization;
 using MegaCrit.Sts2.Core.MonsterMoves.Intents;
 using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Nodes.Cards.Holders;
@@ -26,6 +29,7 @@ using MegaCrit.Sts2.Core.Nodes.Screens.Shops;
 using MegaCrit.Sts2.Core.Nodes.Screens.TreasureRoomRelic;
 using MegaCrit.Sts2.Core.Runs;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.TestSupport;
 using Sts2LlmAgent.Core;
 
 namespace Sts2LlmAgent;
@@ -41,8 +45,54 @@ public sealed class LlmAgentController : Node
     private bool _reportedMultiplayer;
     private string? _lastFingerprint;
     private ulong _nextRequestAt;
+    private string? _suppressedFingerprint;
+    private ulong _suppressedUntil;
 
     private sealed record CombatBinding(AgentAction Action, CardModel? Card, PotionModel? Potion, Creature? Target);
+    private sealed record MerchantBinding(AgentAction Action, NMerchantSlot Slot);
+    private sealed record RewardBinding(AgentAction Action, NRewardButton Button);
+
+    private sealed class LlmCardSelector(LlmAgentController owner) : MegaCrit.Sts2.Core.TestSupport.ICardSelector
+    {
+        public async Task<IEnumerable<CardModel>> GetSelectedCards(IEnumerable<CardModel> options, int minSelect, int maxSelect)
+        {
+            List<CardModel> remaining = options.ToList();
+            List<CardModel> selected = [];
+            int maximum = Math.Min(maxSelect, remaining.Count);
+            while (remaining.Count > 0 && selected.Count < maximum)
+            {
+                List<(CardModel Card, AgentAction Action)> bindings = StableCardActions(remaining, "nested");
+                List<AgentAction> actions = bindings.Select(binding => binding.Action).ToList();
+                if (selected.Count >= minSelect) actions.Add(new("done", "confirm", "Finish selection"));
+                Decision decision = new("nested_card_choice", new
+                {
+                    minSelect,
+                    maxSelect,
+                    selected = selected.Select(card => CardObservation(card, "selected", card.Pile?.Type ?? PileType.None)).ToList(),
+                    options = bindings.Select(binding => CardObservation(binding.Card, binding.Action.Id, binding.Card.Pile?.Type ?? PileType.None)).ToList()
+                }, actions);
+                string? response = await owner.AskWithRetryAsync(decision);
+                if (!DecisionProtocol.TryParseAndValidate(response, actions, out ModelDecision choice))
+                {
+                    if (selected.Count >= minSelect) break;
+                    choice = new(bindings[0].Action.Id, "fallback");
+                }
+                if (choice.ActionId == "done") break;
+                (CardModel Card, AgentAction Action) binding = bindings.Single(binding => binding.Action.Id == choice.ActionId);
+                if (owner._config.Verbose) GD.Print($"[Sts2LlmAgent] nested_card_choice: {choice.Reason}");
+                selected.Add(binding.Card);
+                remaining.Remove(binding.Card);
+            }
+            while (selected.Count < minSelect && remaining.Count > 0)
+            {
+                selected.Add(remaining[0]);
+                remaining.RemoveAt(0);
+            }
+            return selected;
+        }
+
+        public CardRewardSelection GetSelectedCardReward(IReadOnlyList<CardCreationResult> options, IReadOnlyList<CardRewardAlternative> alternatives) => default;
+    }
 
     public LlmAgentController(AgentConfig config)
     {
@@ -99,6 +149,8 @@ public sealed class LlmAgentController : Node
             if (decision is null || decision.Actions.Count == 0) { await FrameAsync(); return; }
             string fingerprint = DecisionProtocol.BuildUserJson(decision);
             ulong now = Time.GetTicksMsec();
+            if (fingerprint != _suppressedFingerprint) _suppressedFingerprint = null;
+            if (fingerprint == _suppressedFingerprint && now < _suppressedUntil) { await FrameAsync(); return; }
             if (fingerprint == _lastFingerprint && now < _nextRequestAt) { await FrameAsync(); return; }
             _lastFingerprint = fingerprint;
             _nextRequestAt = now + 1500;
@@ -106,6 +158,15 @@ public sealed class LlmAgentController : Node
             await FrameAsync();
             if (!NGame.IsMainThread()) throw new InvalidOperationException("LLM continuation left the Godot main thread.");
             await ResolveDecisionAsync(decision, response);
+            for (int i = 0; i < 15; i++) await FrameAsync();
+            RunState? afterRun = RunManager.Instance?.DebugOnlyGetState();
+            Decision? afterDecision = afterRun is null || afterRun.Players.Count != 1 ? null : BuildDecision(afterRun);
+            if (afterDecision is not null && DecisionProtocol.BuildUserJson(afterDecision) == fingerprint)
+            {
+                _suppressedFingerprint = fingerprint;
+                _suppressedUntil = Time.GetTicksMsec() + 30_000;
+                GD.PrintErr($"[Sts2LlmAgent] {decision.Screen}: action caused no observable progress; suppressing this state for 30 seconds");
+            }
         }
         catch (Exception exception) { GD.PrintErr($"[Sts2LlmAgent] {exception.GetType().Name}: {exception.Message}"); await FrameAsync(); }
         finally { _busy = false; }
@@ -274,6 +335,21 @@ public sealed class LlmAgentController : Node
     private static bool CanUsePotion(Player player, PotionModel potion) =>
         !potion.IsQueued && !potion.HasBeenRemovedFromState && player.Creature.IsAlive && player.CanRemovePotions && potion.PassesCustomUsabilityCheck && potion.Usage is PotionUsage.CombatOnly or PotionUsage.AnyTime;
 
+    private static List<(CardModel Card, AgentAction Action)> StableCardActions(IEnumerable<CardModel> cards, string prefix)
+    {
+        Dictionary<string, int> occurrences = [];
+        var result = new List<(CardModel, AgentAction)>();
+        foreach (CardModel card in cards)
+        {
+            string model = card.Id.Entry;
+            int occurrence = occurrences.GetValueOrDefault(model);
+            occurrences[model] = occurrence + 1;
+            string id = $"{prefix}:{model}:{occurrence}";
+            result.Add((card, new AgentAction(id, "choose_card", $"Choose {card.Title}")));
+        }
+        return result;
+    }
+
     private static object CardObservation(CardModel card, string key, PileType pile) => new
     {
         key,
@@ -303,10 +379,22 @@ public sealed class LlmAgentController : Node
     {
         id = power.Id.Entry,
         title = SafeText(() => power.Title.GetFormattedText()),
-        description = SafeText(() => power.SmartDescription.GetFormattedText()),
+        description = SafeText(() => PowerDescription(power)),
         amount = power.DisplayAmount,
         type = power.TypeForCurrentAmount.ToString()
     }).ToList();
+
+    private static string PowerDescription(PowerModel power)
+    {
+        LocString description = power.HasSmartDescription ? power.SmartDescription : power.Description;
+        int playerCount = power.Owner.CombatState?.Players.Count ?? 1;
+        description.Add("Amount", power.Amount);
+        description.Add("OnPlayer", power.Owner.IsPlayer);
+        description.Add("IsMultiplayer", playerCount > 1);
+        description.Add("PlayerCount", playerCount);
+        power.DynamicVars.AddTo(description);
+        return description.GetFormattedText();
+    }
 
     private static object IntentObservation(AbstractIntent intent, ICombatState combat, Creature owner)
     {
@@ -334,7 +422,7 @@ public sealed class LlmAgentController : Node
             actFloor = run.ActFloor,
             current = run.CurrentMapCoord?.ToString(),
             visited = run.VisitedMapCoords.Count
-        }, points.Select((p, i) => new AgentAction("m" + i, "map_path", $"Choose {p.Point.PointType} at row {p.Point.coord.row}, column {p.Point.coord.col}")).ToList());
+        }, points.Select(p => new AgentAction($"map:r{p.Point.coord.row}:c{p.Point.coord.col}", "map_path", $"Choose {p.Point.PointType} at row {p.Point.coord.row}, column {p.Point.coord.col}")).ToList());
     }
 
     private static List<NMapPoint> GetEnabledMapPoints(NRun runNode) => UiHelper.FindAll<NMapPoint>(runNode.GlobalUi.MapScreen)
@@ -380,32 +468,113 @@ public sealed class LlmAgentController : Node
             Player? player = LocalContext.GetMe(run);
             if (shop is null || player is null) return null;
             bool inventoryOpen = shop.Inventory.IsVisibleInTree();
-            var slots = inventoryOpen ? shop.Inventory.GetAllSlots().Where(s => s is not NMerchantCardRemoval && s.Entry.IsStocked && s.Entry.EnoughGold).ToList() : new List<NMerchantSlot>();
-            var actions = slots.Select((s, i) => new AgentAction("s" + i, "buy", $"Buy {s.Entry.GetType().Name} for {s.Entry.Cost} gold")).ToList();
+            List<NMerchantSlot> stocked = inventoryOpen ? shop.Inventory.GetAllSlots().Where(slot => slot is not NMerchantCardRemoval && slot.Entry.IsStocked).ToList() : [];
+            List<MerchantBinding> bindings = StableMerchantBindings(stocked.Where(slot => slot.Entry.EnoughGold));
+            var actions = bindings.Select(binding => binding.Action).ToList();
             if (inventoryOpen) actions.Add(new("close", "close_shop", "Close merchant inventory"));
             else actions.Add(new("open", "open_shop", "Open merchant inventory"));
             if (!inventoryOpen && shop.ProceedButton.IsEnabled) actions.Add(new("proceed", "proceed", "Leave shop"));
-            return new("shop", new { gold = player.Gold }, actions);
+            return new("shop", new
+            {
+                gold = player.Gold,
+                hp = player.Creature.CurrentHp,
+                maxHp = player.Creature.MaxHp,
+                floor = run.TotalFloor,
+                items = stocked.Select(MerchantObservation).ToList(),
+                deck = player.Deck.Cards.Select((card, index) => CardObservation(card, $"deck{index}", PileType.Deck)).ToList(),
+                relics = player.Relics.Select(relic => new { id = relic.Id.Entry, title = SafeText(() => relic.Title.GetFormattedText()), description = SafeText(() => relic.DynamicDescription.GetFormattedText()) }).ToList(),
+                potions = player.Potions.Select(potion => new { id = potion.Id.Entry, title = SafeText(() => potion.Title.GetFormattedText()), description = SafeText(() => potion.DynamicDescription.GetFormattedText()) }).ToList()
+            }, actions);
         }
         return null;
     }
 
+    private static List<MerchantBinding> StableMerchantBindings(IEnumerable<NMerchantSlot> slots)
+    {
+        Dictionary<string, int> occurrences = [];
+        var bindings = new List<MerchantBinding>();
+        foreach (NMerchantSlot slot in slots)
+        {
+            string model = MerchantModelId(slot.Entry);
+            string key = $"{slot.Entry.GetType().Name}:{model}:{slot.Entry.Cost}";
+            int occurrence = occurrences.GetValueOrDefault(key);
+            occurrences[key] = occurrence + 1;
+            AgentAction action = new($"buy:{key}:{occurrence}", "buy", $"Buy {MerchantTitle(slot.Entry)} for {slot.Entry.Cost} gold");
+            bindings.Add(new(action, slot));
+        }
+        return bindings;
+    }
+
+    private static object MerchantObservation(NMerchantSlot slot) => new
+    {
+        id = MerchantModelId(slot.Entry),
+        kind = slot.Entry.GetType().Name,
+        title = MerchantTitle(slot.Entry),
+        description = MerchantDescription(slot.Entry),
+        cost = slot.Entry.Cost,
+        affordable = slot.Entry.EnoughGold,
+        stocked = slot.Entry.IsStocked
+    };
+
+    private static string MerchantModelId(MerchantEntry entry) => entry switch
+    {
+        MerchantCardEntry card => card.CreationResult?.Card.Id.Entry ?? "sold",
+        MerchantRelicEntry relic => relic.Model?.Id.Entry ?? "sold",
+        MerchantPotionEntry potion => potion.Model?.Id.Entry ?? "sold",
+        _ => entry.GetType().Name
+    };
+
+    private static string MerchantTitle(MerchantEntry entry) => entry switch
+    {
+        MerchantCardEntry card => card.CreationResult?.Card.Title ?? "Sold card",
+        MerchantRelicEntry relic => SafeText(() => relic.Model?.Title.GetFormattedText() ?? "Sold relic") ?? "Relic",
+        MerchantPotionEntry potion => SafeText(() => potion.Model?.Title.GetFormattedText() ?? "Sold potion") ?? "Potion",
+        _ => entry.GetType().Name
+    };
+
+    private static string? MerchantDescription(MerchantEntry entry) => entry switch
+    {
+        MerchantCardEntry card when card.CreationResult?.Card is CardModel model => SafeText(() => model.GetDescriptionForPile(PileType.Deck)),
+        MerchantRelicEntry relic when relic.Model is not null => SafeText(() => relic.Model.DynamicDescription.GetFormattedText()),
+        MerchantPotionEntry potion when potion.Model is not null => SafeText(() => potion.Model.DynamicDescription.GetFormattedText()),
+        _ => null
+    };
+
     private Decision? OverlayDecision(Node overlay)
     {
-        var cards = UiHelper.FindAll<NCardHolder>(overlay);
+        List<NCardHolder> cards = UiHelper.FindAll<NCardHolder>(overlay).Where(holder => holder.IsVisibleInTree() && holder.CardModel is not null).ToList();
         if (cards.Count > 0)
         {
-            List<AgentAction> actions = cards.Select((c, i) => new AgentAction("o" + i, "choose_card", c.CardModel?.Title ?? "card")).ToList();
+            List<(CardModel Card, AgentAction Action)> stableCards = StableCardActions(cards.Select(holder => holder.CardModel!), "choice");
+            List<AgentAction> actions = stableCards.Select(binding => binding.Action).ToList();
             if (UiHelper.FindAll<NConfirmButton>(overlay).Any(b => b.IsEnabled)) actions.Add(new("confirm", "confirm", "Confirm selection"));
             if (UiHelper.FindAll<NChoiceSelectionSkipButton>(overlay).Any(b => b.IsEnabled)) actions.Add(new("skip", "skip", "Skip"));
-            return new(overlay.GetType().Name, new { screen = overlay.GetType().Name }, actions);
+            return new(overlay.GetType().Name, new
+            {
+                screen = overlay.GetType().Name,
+                cards = stableCards.Select(binding => CardObservation(binding.Card, binding.Action.Id, binding.Card.Pile?.Type ?? PileType.None)).ToList()
+            }, actions);
         }
-        var rewards = UiHelper.FindAll<NRewardButton>(overlay).Where(b => b.IsEnabled).ToList();
-        if (rewards.Count > 0) return new("rewards", new { screen = overlay.GetType().Name }, rewards.Select((b, i) => new AgentAction("o" + i, "claim_reward", b.Reward?.GetType().Name ?? "reward")).ToList());
+        List<RewardBinding> rewards = StableRewardBindings(overlay);
+        if (rewards.Count > 0) return new("rewards", new { screen = overlay.GetType().Name }, rewards.Select(binding => binding.Action).ToList());
         var proceed = UiHelper.FindAll<NProceedButton>(overlay).Where(b => b.IsEnabled).ToList();
         if (proceed.Count > 0) return new("proceed", new { screen = overlay.GetType().Name }, new[] { new AgentAction("proceed", "proceed", "Proceed") });
         var clickables = UiHelper.FindAll<NClickableControl>(overlay).Where(b => b.IsEnabled && b.Visible).ToList();
         return clickables.Count == 0 ? null : new("generic_overlay", new { screen = overlay.GetType().Name, gameText = "untrusted" }, clickables.Select((b, i) => new AgentAction("g" + i, "click", b.GetType().Name)).ToList());
+    }
+
+    private static List<RewardBinding> StableRewardBindings(Node overlay)
+    {
+        Dictionary<string, int> occurrences = [];
+        var bindings = new List<RewardBinding>();
+        foreach (NRewardButton button in UiHelper.FindAll<NRewardButton>(overlay).Where(button => button.IsEnabled && button.IsVisibleInTree()))
+        {
+            string type = button.Reward?.GetType().Name ?? "UnknownReward";
+            int occurrence = occurrences.GetValueOrDefault(type);
+            occurrences[type] = occurrence + 1;
+            bindings.Add(new(new AgentAction($"reward:{type}:{occurrence}", "claim_reward", $"Claim {type}"), button));
+        }
+        return bindings;
     }
 
     private async Task ResolveDecisionAsync(Decision decision, string? response)
@@ -437,13 +606,30 @@ public sealed class LlmAgentController : Node
         NRun? run = NGame.Instance?.CurrentRunNode;
         if (run is null) return;
         action = liveAction;
-        if (screen == "map") { var points = GetEnabledMapPoints(run); int i = Index(action.Id); if (i >= 0 && i < points.Count) await UiHelper.Click(points[i]); return; }
+        if (screen == "map")
+        {
+            NMapPoint? point = GetEnabledMapPoints(run).SingleOrDefault(point => action.Id == $"map:r{point.Point.coord.row}:c{point.Point.coord.col}");
+            if (point is not null) await UiHelper.Click(point);
+            return;
+        }
         if (NOverlayStack.Instance?.Peek() is Node overlay) { ExecuteOverlay(overlay, liveAction); return; }
         Node room = run.GetNode("RoomContainer"); int index = Index(action.Id);
         if (screen == "event") { var items = UiHelper.FindAll<NEventOptionButton>(room).Where(o => o.IsEnabled && !o.Option.IsLocked).ToList(); if (index >= 0 && index < items.Count) await UiHelper.Click(items[index]); }
         else if (screen == "rest_site") { var rest = room.GetNodeOrNull<NRestSiteRoom>("RestSiteRoom"); if (action.Kind == "proceed" && rest?.ProceedButton.IsEnabled == true) await UiHelper.Click(rest.ProceedButton); else { var items = UiHelper.FindAll<NRestSiteButton>(room).Where(b => b.Option.IsEnabled).ToList(); if (index >= 0 && index < items.Count) await UiHelper.Click(items[index]); } }
         else if (screen == "treasure") { var treasure = room.GetNodeOrNull<NTreasureRoom>("TreasureRoom"); if (treasure is null) return; if (action.Id == "open") { var chest = treasure.GetNodeOrNull<NClickableControl>("Chest"); if (chest?.IsEnabled == true) await UiHelper.Click(chest); } else if (action.Kind == "claim_treasure") { var holders = UiHelper.FindAll<NTreasureRoomRelicHolder>(treasure).Where(h => h.IsEnabled && h.Visible).ToList(); if (index >= 0 && index < holders.Count) await UiHelper.Click(holders[index]); } else if (treasure.ProceedButton.IsEnabled) await UiHelper.Click(treasure.ProceedButton); }
-        else if (screen == "shop") { var shop = room.GetNodeOrNull<NMerchantRoom>("MerchantRoom"); if (shop is null) return; if (action.Kind == "buy") { var slots = shop.Inventory.GetAllSlots().Where(s => s is not NMerchantCardRemoval && s.Entry.IsStocked && s.Entry.EnoughGold).ToList(); if (index >= 0 && index < slots.Count) await slots[index].Entry.OnTryPurchaseWrapper(shop.Inventory.Inventory); } else if (action.Kind == "open_shop" && !shop.Inventory.IsVisibleInTree()) shop.OpenInventory(); else if (action.Kind == "close_shop") UiHelper.FindAll<NBackButton>(shop).FirstOrDefault(b => b.IsEnabled)?.ForceClick(); else if (shop.ProceedButton.IsEnabled) await UiHelper.Click(shop.ProceedButton); }
+        else if (screen == "shop")
+        {
+            var shop = room.GetNodeOrNull<NMerchantRoom>("MerchantRoom");
+            if (shop is null) return;
+            if (action.Kind == "buy")
+            {
+                MerchantBinding? binding = StableMerchantBindings(shop.Inventory.GetAllSlots().Where(slot => slot is not NMerchantCardRemoval && slot.Entry.IsStocked && slot.Entry.EnoughGold)).SingleOrDefault(binding => binding.Action.Id == action.Id);
+                if (binding is not null) await binding.Slot.Entry.OnTryPurchaseWrapper(shop.Inventory.Inventory);
+            }
+            else if (action.Kind == "open_shop" && !shop.Inventory.IsVisibleInTree()) shop.OpenInventory();
+            else if (action.Kind == "close_shop") UiHelper.FindAll<NBackButton>(shop).FirstOrDefault(b => b.IsEnabled)?.ForceClick();
+            else if (shop.ProceedButton.IsEnabled) await UiHelper.Click(shop.ProceedButton);
+        }
     }
 
     private async Task ExecuteCombat(AgentAction action)
@@ -452,14 +638,16 @@ public sealed class LlmAgentController : Node
         Player? player = LocalContext.GetMe(run); if (player?.PlayerCombatState?.Phase != PlayerTurnPhase.Play) return;
         if (action.Kind == "end_turn") { PlayerCmd.EndTurn(player, false); return; }
         CombatBinding? binding = BuildCombatBindings(player).SingleOrDefault(candidate => candidate.Action.Id == action.Id && candidate.Action.Kind == action.Kind);
-        if (binding?.Card is CardModel card && card.TryManualPlay(binding.Target))
+        if (binding?.Card is CardModel card)
         {
-            ulong deadline = Time.GetTicksMsec() + 10_000;
-            while (Time.GetTicksMsec() < deadline
-                && player.PlayerCombatState?.Phase == PlayerTurnPhase.Play
-                && card.Pile?.Type == PileType.Hand)
+            using IDisposable selector = CardSelectCmd.PushSelector(new LlmCardSelector(this));
+            if (!card.TryManualPlay(binding.Target)) return;
+            ulong deadline = Time.GetTicksMsec() + 30_000;
+            while (Time.GetTicksMsec() < deadline && player.PlayerCombatState?.Phase == PlayerTurnPhase.Play)
             {
                 _lifetime.Token.ThrowIfCancellationRequested();
+                PileType? pile = card.Pile?.Type;
+                if (pile is not (PileType.Hand or PileType.Play)) break;
                 await FrameAsync();
             }
         }
@@ -468,12 +656,17 @@ public sealed class LlmAgentController : Node
 
     private static void ExecuteOverlay(Node overlay, AgentAction action)
     {
-        int i = Index(action.Id); if (i < 0) return;
         if (action.Kind == "skip") { UiHelper.FindAll<NChoiceSelectionSkipButton>(overlay).FirstOrDefault(b => b.IsEnabled)?.ForceClick(); }
         else if (action.Kind == "confirm") { UiHelper.FindAll<NConfirmButton>(overlay).FirstOrDefault(b => b.IsEnabled)?.ForceClick(); }
-        else if (action.Kind == "choose_card") { var cards = UiHelper.FindAll<NCardHolder>(overlay); if (i < cards.Count) cards[i].EmitSignal(NCardHolder.SignalName.Pressed, cards[i]); }
-        else if (action.Kind == "claim_reward") { var rewards = UiHelper.FindAll<NRewardButton>(overlay).Where(b => b.IsEnabled).ToList(); if (i < rewards.Count) rewards[i].ForceClick(); }
-        else if (action.Kind == "click") { var buttons = UiHelper.FindAll<NClickableControl>(overlay).Where(b => b.IsEnabled && b.Visible).ToList(); if (i < buttons.Count) buttons[i].ForceClick(); }
+        else if (action.Kind == "choose_card")
+        {
+            List<NCardHolder> holders = UiHelper.FindAll<NCardHolder>(overlay).Where(holder => holder.IsVisibleInTree() && holder.CardModel is not null).ToList();
+            List<(CardModel Card, AgentAction Action)> cards = StableCardActions(holders.Select(holder => holder.CardModel!), "choice");
+            int index = cards.FindIndex(binding => binding.Action.Id == action.Id);
+            if (index >= 0) holders[index].EmitSignal(NCardHolder.SignalName.Pressed, holders[index]);
+        }
+        else if (action.Kind == "claim_reward") StableRewardBindings(overlay).SingleOrDefault(binding => binding.Action.Id == action.Id)?.Button.ForceClick();
+        else if (action.Kind == "click") { int i = Index(action.Id); var buttons = UiHelper.FindAll<NClickableControl>(overlay).Where(b => b.IsEnabled && b.Visible).ToList(); if (i >= 0 && i < buttons.Count) buttons[i].ForceClick(); }
         else { var button = UiHelper.FindAll<NProceedButton>(overlay).FirstOrDefault(b => b.IsEnabled); button?.ForceClick(); }
     }
 
