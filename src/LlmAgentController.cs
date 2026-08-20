@@ -37,6 +37,7 @@ public sealed class LlmAgentController : Node
     private readonly ChatClient _client;
     private CancellationTokenSource _lifetime = new();
     private bool _busy;
+    private bool _started;
     private bool _reportedMultiplayer;
     private string? _lastFingerprint;
     private ulong _nextRequestAt;
@@ -53,12 +54,32 @@ public sealed class LlmAgentController : Node
 
     public override void _Ready() => GD.Print("[Sts2LlmAgent] controller ready");
 
-    public override void _Process(double delta)
+    public void Start()
     {
-        if (!_busy) _ = TickAsync();
+        if (_started) return;
+        _started = true;
+        GD.Print("[Sts2LlmAgent] controller loop started");
+        _ = RunLoopAsync();
     }
 
     public override void _ExitTree() { _lifetime.Cancel(); _client.Dispose(); }
+
+    private async Task RunLoopAsync()
+    {
+        try
+        {
+            while (!_lifetime.IsCancellationRequested && GodotObject.IsInstanceValid(this) && IsInsideTree())
+            {
+                await FrameAsync();
+                if (!_busy) await TickAsync();
+            }
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
+        catch (Exception exception)
+        {
+            GD.PrintErr($"[Sts2LlmAgent] loop stopped: {exception.GetType().Name}: {exception.Message}");
+        }
+    }
 
     private async Task TickAsync()
     {
