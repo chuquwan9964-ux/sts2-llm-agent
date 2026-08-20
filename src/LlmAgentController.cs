@@ -143,17 +143,7 @@ public sealed class LlmAgentController : Node
         if (player is null || pcs?.Phase != PlayerTurnPhase.Play || combat is null) return null;
         List<CombatBinding> bindings = BuildCombatBindings(player);
         bindings.Add(new(new("end", "end_turn", "End turn"), null, null, null));
-        var hand = pcs.Hand.Cards.Select((card, index) => new
-        {
-            key = $"h{index}",
-            model = card.Id.Entry,
-            title = card.Title,
-            type = card.Type.ToString(),
-            cost = card.EnergyCost.CostsX ? "X" : card.EnergyCost.GetWithModifiers(CostModifiers.All).ToString(),
-            upgraded = card.IsUpgraded,
-            description = SafeText(() => card.GetDescriptionForPile(PileType.Hand)),
-            playable = card.CanPlay(out _, out _)
-        }).ToList();
+        var hand = pcs.Hand.Cards.Select((card, index) => CardObservation(card, $"h{index}", PileType.Hand)).ToList();
         var potions = player.PotionSlots.Select((potion, index) => potion is null ? null : new
         {
             key = $"s{index}",
@@ -165,22 +155,56 @@ public sealed class LlmAgentController : Node
         }).Where(potion => potion is not null).ToList();
         var observation = new
         {
+            rules = new
+            {
+                baseCardsDrawnAtTurnStart = 5,
+                handLimit = CardPile.MaxCardsInHand,
+                drawPileOrderIsKnown = false,
+                oneActionIsChosenPerRequest = true
+            },
             turn = pcs.TurnNumber,
             round = combat.RoundNumber,
             phase = pcs.Phase.ToString(),
             player = new
             {
+                character = new
+                {
+                    id = player.Character.Id.Entry,
+                    name = SafeText(() => player.Character.Title.GetFormattedText())
+                },
                 hp = player.Creature.CurrentHp,
                 maxHp = player.Creature.MaxHp,
                 block = player.Creature.Block,
                 energy = pcs.Energy,
                 maxEnergy = pcs.MaxEnergy,
                 stars = pcs.Stars,
-                powers = PowerObservation(player.Creature)
+                powers = PowerObservation(player.Creature),
+                relics = player.Relics.Select(relic => new
+                {
+                    id = relic.Id.Entry,
+                    title = SafeText(() => relic.Title.GetFormattedText()),
+                    description = SafeText(() => relic.DynamicDescription.GetFormattedText()),
+                    counter = relic.ShowCounter ? relic.DisplayAmount : null as int?
+                }).ToList()
             },
-            piles = new { draw = pcs.DrawPile.Cards.Count, discard = pcs.DiscardPile.Cards.Count, exhaust = pcs.ExhaustPile.Cards.Count },
+            piles = new
+            {
+                draw = PileObservation(pcs.DrawPile, orderKnown: false),
+                discard = PileObservation(pcs.DiscardPile, orderKnown: false),
+                exhaust = PileObservation(pcs.ExhaustPile, orderKnown: false),
+                play = PileObservation(pcs.PlayPile, orderKnown: true)
+            },
+            masterDeck = PileObservation(player.Deck, orderKnown: false),
             hand,
             potions,
+            cardsPlayedThisTurn = CombatManager.Instance.History.CardPlaysFinished
+                .Where(entry => entry.Actor == player.Creature && entry.HappenedThisTurn(combat))
+                .Select(entry => new
+                {
+                    id = entry.CardPlay.Card.Id.Entry,
+                    title = entry.CardPlay.Card.Title,
+                    target = entry.CardPlay.Target?.Name
+                }).ToList(),
             enemies = combat.Enemies.Select((enemy, index) => new
             {
                 key = $"e{index}",
@@ -189,6 +213,8 @@ public sealed class LlmAgentController : Node
                 hp = enemy.CurrentHp,
                 maxHp = enemy.MaxHp,
                 block = enemy.Block,
+                alive = enemy.IsAlive,
+                hittable = enemy.IsHittable,
                 powers = PowerObservation(enemy),
                 intents = enemy.Monster?.NextMove.Intents.Select(intent => IntentObservation(intent, combat, enemy)).ToList()
             }).ToList()
@@ -242,6 +268,31 @@ public sealed class LlmAgentController : Node
 
     private static bool CanUsePotion(Player player, PotionModel potion) =>
         !potion.IsQueued && !potion.HasBeenRemovedFromState && player.Creature.IsAlive && player.CanRemovePotions && potion.PassesCustomUsabilityCheck && potion.Usage is PotionUsage.CombatOnly or PotionUsage.AnyTime;
+
+    private static object CardObservation(CardModel card, string key, PileType pile) => new
+    {
+        key,
+        model = card.Id.Entry,
+        title = card.Title,
+        type = card.Type.ToString(),
+        rarity = card.Rarity.ToString(),
+        cost = card.EnergyCost.CostsX ? "X" : card.EnergyCost.GetWithModifiers(CostModifiers.All).ToString(),
+        upgraded = card.IsUpgraded,
+        keywords = card.Keywords.Select(keyword => keyword.ToString()).ToList(),
+        description = SafeText(() => card.GetDescriptionForPile(pile)),
+        playable = pile == PileType.Hand ? card.CanPlay(out _, out _) : null as bool?
+    };
+
+    private static object PileObservation(CardPile pile, bool orderKnown) => new
+    {
+        count = pile.Cards.Count,
+        orderKnown,
+        cards = pile.Cards
+            .OrderBy(card => card.Id.Entry)
+            .ThenBy(card => card.CurrentUpgradeLevel)
+            .Select((card, index) => CardObservation(card, $"{pile.Type.ToString().ToLowerInvariant()}{index}", pile.Type))
+            .ToList()
+    };
 
     private static object PowerObservation(Creature creature) => creature.Powers.Where(power => power.IsVisible).Select(power => new
     {
