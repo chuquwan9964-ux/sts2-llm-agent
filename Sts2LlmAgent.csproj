@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable>
+    <AssemblyName>Sts2LlmAgent</AssemblyName><RootNamespace>Sts2LlmAgent</RootNamespace>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="tests/**/*.cs;obj/**/*.cs;bin/**/*.cs;src/AgentConfig.cs;src/DecisionProtocol.cs;src/ChatClient.cs" />
+    <ProjectReference Include="Sts2LlmAgent.Core.csproj" />
+    <Reference Include="sts2"><HintPath>$(Sts2ManagedDir)/sts2.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="GodotSharp"><HintPath>$(Sts2ManagedDir)/GodotSharp.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+  <Target Name="ValidateSts2ManagedDir" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="'$(Sts2ManagedDir)' == ''" Text="Sts2ManagedDir is required. Pass -p:Sts2ManagedDir=/path/to/the/game/managed-directory or use build-install.sh." />
+    <Error Condition="'$(Sts2ManagedDir)' != '' and !Exists('$(Sts2ManagedDir)/sts2.dll')" Text="Sts2ManagedDir does not contain sts2.dll: $(Sts2ManagedDir)" />
+    <Error Condition="'$(Sts2ManagedDir)' != '' and !Exists('$(Sts2ManagedDir)/GodotSharp.dll')" Text="Sts2ManagedDir does not contain GodotSharp.dll: $(Sts2ManagedDir)" />
+  </Target>
+</Project>
