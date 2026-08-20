@@ -371,6 +371,7 @@ public sealed class LlmAgentController : Node
                 alive = enemy.IsAlive,
                 hittable = enemy.IsHittable,
                 powers = PowerObservation(enemy),
+                nextMove = EnemyForecast(enemy, combat),
                 intents = enemy.Monster?.NextMove.Intents.Select(intent => IntentObservation(intent, combat, enemy)).ToList()
             }).ToList()
         };
@@ -502,9 +503,41 @@ public sealed class LlmAgentController : Node
         {
             type = intent.IntentType.ToString(),
             label = SafeText(() => intent.GetIntentLabel(combat.Allies, owner).GetFormattedText()),
-            damage = attack is null ? null : SafeInt(() => attack.GetSingleDamage(combat.Allies, owner)),
-            hits = attack?.Repeats,
-            total = attack is null ? null : SafeInt(() => attack.GetTotalDamage(combat.Allies, owner))
+            amountKnown = attack is not null || intent is StatusIntent,
+            damagePerHit = attack is null ? null : SafeInt(() => attack.GetSingleDamage(combat.Allies, owner)),
+            hits = attack is null ? null : (int?)Math.Max(1, attack.Repeats),
+            totalDamage = attack is null ? null : SafeInt(() => attack.GetTotalDamage(combat.Allies, owner)),
+            statusCards = (intent as StatusIntent)?.CardCount
+        };
+    }
+
+    private static object? EnemyForecast(Creature enemy, ICombatState combat)
+    {
+        if (enemy.Monster?.NextMove is not { } move) return null;
+        List<AbstractIntent> intents = move.Intents.ToList();
+        List<AttackIntent> attacks = intents.OfType<AttackIntent>().ToList();
+        return new
+        {
+            moveId = move.StateId,
+            attack = new
+            {
+                amountKnown = attacks.Count > 0,
+                totalDamage = attacks.Count == 0 ? null : (int?)attacks.Sum(attack => SafeInt(() => attack.GetTotalDamage(combat.Allies, enemy)) ?? 0),
+                parts = attacks.Select(attack => new
+                {
+                    damagePerHit = SafeInt(() => attack.GetSingleDamage(combat.Allies, enemy)),
+                    hits = Math.Max(1, attack.Repeats),
+                    totalDamage = SafeInt(() => attack.GetTotalDamage(combat.Allies, enemy))
+                }).ToList()
+            },
+            defend = new { present = intents.Any(intent => intent is DefendIntent), amountKnown = false, amount = null as int? },
+            heal = new { present = intents.Any(intent => intent is HealIntent), amountKnown = false, amount = null as int? },
+            buff = new { present = intents.Any(intent => intent is BuffIntent), amountKnown = false, amount = null as int? },
+            debuff = new { present = intents.Any(intent => intent is DebuffIntent or CardDebuffIntent), amountKnown = false },
+            statusCards = intents.OfType<StatusIntent>().Sum(intent => intent.CardCount),
+            summons = intents.Any(intent => intent is SummonIntent),
+            stun = intents.Any(intent => intent is StunIntent),
+            hidden = intents.Any(intent => intent is HiddenIntent or UnknownIntent)
         };
     }
 
@@ -812,7 +845,13 @@ public sealed class LlmAgentController : Node
     {
         PlayerCombatState state = player.PlayerCombatState!;
         string enemies = string.Join("; ", combat.Enemies.Select((enemy, index) =>
-            $"e{index}:{enemy.Name} hp={enemy.CurrentHp}/{enemy.MaxHp} block={enemy.Block} intent={enemy.Monster?.NextMove.Intents.FirstOrDefault()?.IntentType}"));
+        {
+            List<AbstractIntent> intents = enemy.Monster?.NextMove.Intents.ToList() ?? [];
+            List<AttackIntent> attacks = intents.OfType<AttackIntent>().ToList();
+            int? damage = attacks.Count == 0 ? null : attacks.Sum(attack => SafeInt(() => attack.GetTotalDamage(combat.Allies, enemy)) ?? 0);
+            string values = damage.HasValue ? $"attack={damage.Value}" : string.Join('+', intents.Select(intent => intent.IntentType));
+            return $"e{index}:{enemy.Name} hp={enemy.CurrentHp}/{enemy.MaxHp} block={enemy.Block} move={enemy.Monster?.NextMove.StateId} next={values}";
+        }));
         GD.Print($"[Sts2LlmAgent] state {label}: player hp={player.Creature.CurrentHp}/{player.Creature.MaxHp} block={player.Creature.Block} energy={state.Energy}/{state.MaxEnergy} hand={state.Hand.Cards.Count} draw={state.DrawPile.Cards.Count} discard={state.DiscardPile.Cards.Count} exhaust={state.ExhaustPile.Cards.Count} enemies=[{enemies}]");
     }
 
