@@ -43,7 +43,15 @@ public sealed class LlmAgentController : Node
 
     private sealed record CombatBinding(AgentAction Action, CardModel? Card, PotionModel? Potion, Creature? Target);
 
-    public LlmAgentController(AgentConfig config) { _config = config; _client = new ChatClient(config); Name = "Sts2LlmAgentController"; }
+    public LlmAgentController(AgentConfig config)
+    {
+        _config = config;
+        _client = new ChatClient(config);
+        Name = "Sts2LlmAgentController";
+        ProcessMode = ProcessModeEnum.Always;
+    }
+
+    public override void _Ready() => GD.Print("[Sts2LlmAgent] controller ready");
 
     public override void _Process(double delta)
     {
