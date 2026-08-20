@@ -180,9 +180,15 @@ public sealed class LlmAgentController : Node
             {
                 string? response = await _client.ChooseAsync(decision, _lifetime.Token);
                 if (DecisionProtocol.TryParseAndValidate(response, decision.Actions, out _)) return response;
+                if (_config.Verbose)
+                {
+                    string summary = response ?? "<empty>";
+                    if (summary.Length > 500) summary = summary[..500];
+                    GD.PrintErr($"[Sts2LlmAgent] invalid LLM response for {decision.Screen}: {summary}");
+                }
             }
             catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException or JsonException)
-            { if (_config.Verbose) GD.PrintErr($"[Sts2LlmAgent] request failed: {exception.GetType().Name}"); }
+            { GD.PrintErr($"[Sts2LlmAgent] request failed for {decision.Screen}: {exception.GetType().Name}: {exception.Message}"); }
         }
         return null;
     }
@@ -582,7 +588,11 @@ public sealed class LlmAgentController : Node
         AgentAction? action;
         if (!DecisionProtocol.TryParseAndValidate(response, decision.Actions, out ModelDecision chosen))
         {
-            action = DecisionPolicy.ConservativeFallback(decision);
+            action = decision.Screen == "combat"
+                ? decision.Actions.FirstOrDefault(candidate => candidate.Kind == "play_card")
+                    ?? decision.Actions.FirstOrDefault(candidate => candidate.Kind == "use_potion")
+                    ?? decision.Actions.FirstOrDefault(candidate => candidate.Kind == "end_turn")
+                : DecisionPolicy.ConservativeFallback(decision);
             if (action is null)
             {
                 if (_config.Verbose) GD.Print($"[Sts2LlmAgent] {decision.Screen}: no safe fallback; waiting");
@@ -612,7 +622,7 @@ public sealed class LlmAgentController : Node
             if (point is not null) await UiHelper.Click(point);
             return;
         }
-        if (NOverlayStack.Instance?.Peek() is Node overlay) { ExecuteOverlay(overlay, liveAction); return; }
+        if (NOverlayStack.Instance?.Peek() is Node overlay) { await ExecuteOverlayAsync(overlay, liveAction); return; }
         Node room = run.GetNode("RoomContainer"); int index = Index(action.Id);
         if (screen == "event") { var items = UiHelper.FindAll<NEventOptionButton>(room).Where(o => o.IsEnabled && !o.Option.IsLocked).ToList(); if (index >= 0 && index < items.Count) await UiHelper.Click(items[index]); }
         else if (screen == "rest_site") { var rest = room.GetNodeOrNull<NRestSiteRoom>("RestSiteRoom"); if (action.Kind == "proceed" && rest?.ProceedButton.IsEnabled == true) await UiHelper.Click(rest.ProceedButton); else { var items = UiHelper.FindAll<NRestSiteButton>(room).Where(b => b.Option.IsEnabled).ToList(); if (index >= 0 && index < items.Count) await UiHelper.Click(items[index]); } }
@@ -654,7 +664,7 @@ public sealed class LlmAgentController : Node
         else if (binding?.Potion is PotionModel potion && CanUsePotion(player, potion) && potion.IsValidTarget(binding.Target)) potion.EnqueueManualUse(binding.Target);
     }
 
-    private static void ExecuteOverlay(Node overlay, AgentAction action)
+    private async Task ExecuteOverlayAsync(Node overlay, AgentAction action)
     {
         if (action.Kind == "skip") { UiHelper.FindAll<NChoiceSelectionSkipButton>(overlay).FirstOrDefault(b => b.IsEnabled)?.ForceClick(); }
         else if (action.Kind == "confirm") { UiHelper.FindAll<NConfirmButton>(overlay).FirstOrDefault(b => b.IsEnabled)?.ForceClick(); }
@@ -663,11 +673,35 @@ public sealed class LlmAgentController : Node
             List<NCardHolder> holders = UiHelper.FindAll<NCardHolder>(overlay).Where(holder => holder.IsVisibleInTree() && holder.CardModel is not null).ToList();
             List<(CardModel Card, AgentAction Action)> cards = StableCardActions(holders.Select(holder => holder.CardModel!), "choice");
             int index = cards.FindIndex(binding => binding.Action.Id == action.Id);
-            if (index >= 0) holders[index].EmitSignal(NCardHolder.SignalName.Pressed, holders[index]);
+            if (index >= 0)
+            {
+                holders[index].EmitSignal(NCardHolder.SignalName.Pressed, holders[index]);
+                await CompleteCardSelectionAsync(overlay);
+            }
         }
         else if (action.Kind == "claim_reward") StableRewardBindings(overlay).SingleOrDefault(binding => binding.Action.Id == action.Id)?.Button.ForceClick();
         else if (action.Kind == "click") { int i = Index(action.Id); var buttons = UiHelper.FindAll<NClickableControl>(overlay).Where(b => b.IsEnabled && b.Visible).ToList(); if (i >= 0 && i < buttons.Count) buttons[i].ForceClick(); }
         else { var button = UiHelper.FindAll<NProceedButton>(overlay).FirstOrDefault(b => b.IsEnabled); button?.ForceClick(); }
+    }
+
+    private async Task CompleteCardSelectionAsync(Node originalOverlay)
+    {
+        for (int stage = 0; stage < 2; stage++)
+        {
+            NConfirmButton? confirm = null;
+            ulong deadline = Time.GetTicksMsec() + 3_000;
+            while (Time.GetTicksMsec() < deadline && GodotObject.IsInstanceValid(originalOverlay) && originalOverlay.IsInsideTree())
+            {
+                confirm = UiHelper.FindAll<NConfirmButton>(originalOverlay)
+                    .FirstOrDefault(button => button.IsEnabled && button.IsVisibleInTree());
+                if (confirm is not null) break;
+                await FrameAsync();
+            }
+            if (confirm is null) return;
+            confirm.ForceClick();
+            for (int frame = 0; frame < 5; frame++) await FrameAsync();
+            if (!GodotObject.IsInstanceValid(originalOverlay) || !originalOverlay.IsInsideTree() || NOverlayStack.Instance?.Peek() != originalOverlay) return;
+        }
     }
 
     private static int Index(string id) => int.TryParse(id.AsSpan(1), out int value) ? value : -1;
