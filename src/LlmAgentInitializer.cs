@@ -13,6 +13,7 @@ public static class LlmAgentInitializer
     public static void Initialize()
     {
         AgentConfig config = AgentConfig.FromEnvironment();
+        GD.Print($"[Sts2LlmAgent] initializer enabled={config.Enabled}, apiKeyPresent={!string.IsNullOrWhiteSpace(config.ApiKey)}, model={config.Model}");
         if (!config.Enabled || string.IsNullOrWhiteSpace(config.ApiKey)) return;
         AttachOrRetry(config);
     }
@@ -28,6 +29,8 @@ public static class LlmAgentInitializer
         }
         if (!NGame.IsMainThread()) { Callable.From(() => AttachOrRetry(config)).CallDeferred(); return; }
         _attached = true;
-        game.AddChild(new LlmAgentController(config));
+        LlmAgentController controller = new(config);
+        game.AddChild(controller);
+        GD.Print("[Sts2LlmAgent] controller attached");
     }
 }
