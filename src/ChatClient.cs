@@ -32,6 +32,9 @@ public sealed class ChatClient : IDisposable
 
         Explain the concrete tactical calculation briefly in reason, then choose one listed action_id.
         """;
+    private const string ShopSystemPrompt = """
+        You are an expert Slay the Spire 2 deck builder in a merchant. Evaluate the complete item descriptions, current deck, relics, potions, HP, floor, prices, and remaining gold. Do not buy merely because an item is cheap. Prefer purchases that materially improve damage, defense, consistency, scaling, or an established synergy. Account for deck bloat and opportunity cost. It is valid to close or leave without buying. Choose exactly one listed action_id.
+        """;
 
     public ChatClient(AgentConfig config)
     {
@@ -42,7 +45,12 @@ public sealed class ChatClient : IDisposable
 
     public async Task<string?> ChooseAsync(Decision decision, CancellationToken cancellationToken)
     {
-        string systemPrompt = decision.Screen == "combat" ? BaseSystemPrompt + "\n\n" + CombatSystemPrompt : BaseSystemPrompt;
+        string systemPrompt = decision.Screen switch
+        {
+            "combat" => BaseSystemPrompt + "\n\n" + CombatSystemPrompt,
+            "shop" => BaseSystemPrompt + "\n\n" + ShopSystemPrompt,
+            _ => BaseSystemPrompt
+        };
         var request = new { model = _config.Model, temperature = 0, max_tokens = 180, response_format = new { type = "json_object" }, messages = new[] { new { role = "system", content = systemPrompt }, new { role = "user", content = DecisionProtocol.BuildUserJson(decision) } } };
         using HttpResponseMessage response = await _http.PostAsync(_config.ChatCompletionsUrl, new StringContent(JsonSerializer.Serialize(request), Encoding.UTF8, "application/json"), cancellationToken);
         if (!response.IsSuccessStatusCode) return null;
