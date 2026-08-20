@@ -384,7 +384,17 @@ public sealed class LlmAgentController : Node
         Player? player = LocalContext.GetMe(run); if (player?.PlayerCombatState?.Phase != PlayerTurnPhase.Play) return;
         if (action.Kind == "end_turn") { PlayerCmd.EndTurn(player, false); return; }
         CombatBinding? binding = BuildCombatBindings(player).SingleOrDefault(candidate => candidate.Action.Id == action.Id && candidate.Action.Kind == action.Kind);
-        if (binding?.Card is CardModel card && card.CanPlay(out _, out _) && card.IsValidTarget(binding.Target)) await CardCmd.AutoPlay(new BlockingPlayerChoiceContext(), card, binding.Target);
+        if (binding?.Card is CardModel card && card.TryManualPlay(binding.Target))
+        {
+            ulong deadline = Time.GetTicksMsec() + 10_000;
+            while (Time.GetTicksMsec() < deadline
+                && player.PlayerCombatState?.Phase == PlayerTurnPhase.Play
+                && card.Pile?.Type == PileType.Hand)
+            {
+                _lifetime.Token.ThrowIfCancellationRequested();
+                await FrameAsync();
+            }
+        }
         else if (binding?.Potion is PotionModel potion && CanUsePotion(player, potion) && potion.IsValidTarget(binding.Target)) potion.EnqueueManualUse(binding.Target);
     }
 
