@@ -49,6 +49,12 @@ public sealed class LlmAgentController : Node
     private ulong _nextRequestAt;
     private string? _suppressedFingerprint;
     private ulong _suppressedUntil;
+    private readonly List<RecentAction> _recentActions = [];
+    private AgentMemory _memory = DefaultMemory(1);
+    private RunState? _memoryRun;
+    private int _memoryAct = -1;
+    private bool _memoryWasCombat;
+    private int _memoryTurn = -1;
 
     private sealed record CombatBinding(AgentAction Action, CardModel? Card, PotionModel? Potion, Creature? Target);
     private sealed record MerchantBinding(AgentAction Action, NMerchantSlot Slot);
@@ -84,6 +90,7 @@ public sealed class LlmAgentController : Node
                 if (owner._config.Verbose) GD.Print($"[Sts2LlmAgent] nested_card_choice: {choice.Reason}");
                 selected.Add(binding.Card);
                 remaining.Remove(binding.Card);
+                owner.AddRecentAction(new("nested_card_choice", binding.Action.Id, binding.Action.Kind, binding.Action.Label, "selected"));
             }
             while (selected.Count < minSelect && remaining.Count > 0)
             {
@@ -147,6 +154,7 @@ public sealed class LlmAgentController : Node
                 return;
             }
             _reportedMultiplayer = false;
+            UpdateMemoryLifecycle(run);
             Decision? decision = BuildDecision(run);
             if (decision is null || decision.Actions.Count == 0) { await FrameAsync(); return; }
             string fingerprint = DecisionProtocol.BuildUserJson(decision);
@@ -176,12 +184,17 @@ public sealed class LlmAgentController : Node
 
     private async Task<string?> AskWithRetryAsync(Decision decision)
     {
+        Decision request = decision with { Memory = _memory, RecentActions = _recentActions.ToList() };
         for (int attempt = 0; attempt < 2; attempt++)
         {
             try
             {
-                string? response = await _client.ChooseAsync(decision, _lifetime.Token);
-                if (DecisionProtocol.TryParseAndValidate(response, decision.Actions, out _)) return response;
+                string? response = await _client.ChooseAsync(request, _lifetime.Token);
+                if (DecisionProtocol.TryParseAndValidate(response, decision.Actions, out ModelDecision parsed))
+                {
+                    if (parsed.Memory is not null) _memory = parsed.Memory;
+                    return response;
+                }
                 if (_config.Verbose)
                 {
                     string summary = response ?? "<empty>";
@@ -193,6 +206,64 @@ public sealed class LlmAgentController : Node
             { GD.PrintErr($"[Sts2LlmAgent] request failed for {decision.Screen}: {exception.GetType().Name}: {exception.Message}"); }
         }
         return null;
+    }
+
+    private static AgentMemory DefaultMemory(int act) => new(
+        $"Survive act {act}, reach its boss, and defeat it while preserving HP",
+        string.Empty,
+        string.Empty,
+        "Build a compact deck with reliable damage, defense, and scaling",
+        "Prefer routes that preserve enough HP and provide a rest site before the boss",
+        "Save potions for meaningful HP preservation, dangerous fights, or the boss");
+
+    private void UpdateMemoryLifecycle(RunState run)
+    {
+        if (!ReferenceEquals(_memoryRun, run))
+        {
+            _memoryRun = run;
+            _memoryAct = run.CurrentActIndex;
+            _memoryWasCombat = false;
+            _memoryTurn = -1;
+            _recentActions.Clear();
+            _memory = DefaultMemory(run.CurrentActIndex + 1);
+        }
+        if (_memoryAct != run.CurrentActIndex)
+        {
+            _memoryAct = run.CurrentActIndex;
+            _memory = _memory with
+            {
+                ActGoal = $"Survive act {run.CurrentActIndex + 1}, reach its boss, and defeat it while preserving HP",
+                TurnPlan = string.Empty,
+                CombatPlan = string.Empty,
+                RoutePlan = "Re-evaluate the new act route and preserve a rest option before the boss"
+            };
+            _memoryTurn = -1;
+        }
+        bool inCombat = CombatManager.Instance.IsInProgress;
+        if (inCombat && !_memoryWasCombat)
+        {
+            _memory = _memory with { TurnPlan = string.Empty, CombatPlan = "Assess enemy mechanics, intents, lethal timing, and a low-damage victory plan" };
+            _memoryTurn = -1;
+        }
+        else if (!inCombat && _memoryWasCombat)
+        {
+            _memory = _memory with { TurnPlan = string.Empty, CombatPlan = string.Empty };
+            _memoryTurn = -1;
+        }
+        _memoryWasCombat = inCombat;
+        Player? player = LocalContext.GetMe(run);
+        int turn = player?.PlayerCombatState?.TurnNumber ?? -1;
+        if (inCombat && turn != _memoryTurn)
+        {
+            _memoryTurn = turn;
+            _memory = _memory with { TurnPlan = string.Empty };
+        }
+    }
+
+    private void AddRecentAction(RecentAction action)
+    {
+        _recentActions.Add(action);
+        if (_recentActions.Count > 12) _recentActions.RemoveRange(0, _recentActions.Count - 12);
     }
 
     private Decision? BuildDecision(RunState run)
@@ -624,7 +695,29 @@ public sealed class LlmAgentController : Node
         }
         else action = decision.Actions.Single(candidate => candidate.Id == chosen.ActionId);
         if (_config.Verbose && chosen.Reason.Length > 0) GD.Print($"[Sts2LlmAgent] {decision.Screen}: {chosen.Reason}");
+        string before = DecisionProtocol.BuildUserJson(decision with { Memory = null, RecentActions = null });
         await ExecuteAsync(decision.Screen, action).WaitAsync(TimeSpan.FromSeconds(15), _lifetime.Token);
+        for (int frame = 0; frame < 3; frame++) await FrameAsync();
+        RunState? run = RunManager.Instance?.DebugOnlyGetState();
+        Decision? afterDecision = run is null || run.Players.Count != 1 ? null : BuildDecision(run);
+        string? after = afterDecision is null ? null : DecisionProtocol.BuildUserJson(afterDecision with { Memory = null, RecentActions = null });
+        if (after != before)
+        {
+            AddRecentAction(new(decision.Screen, action.Id, action.Kind, action.Label, SummarizeCurrentState(run)));
+        }
+    }
+
+    private static string SummarizeCurrentState(RunState? run)
+    {
+        if (run is null) return "run ended or returned to menu";
+        Player? player = LocalContext.GetMe(run);
+        if (player is null) return $"act={run.CurrentActIndex + 1} floor={run.TotalFloor}";
+        string summary = $"act={run.CurrentActIndex + 1} floor={run.TotalFloor} hp={player.Creature.CurrentHp}/{player.Creature.MaxHp}";
+        if (player.PlayerCombatState is PlayerCombatState state)
+        {
+            summary += $" turn={state.TurnNumber} energy={state.Energy} block={player.Creature.Block} hand={state.Hand.Cards.Count}";
+        }
+        return summary;
     }
 
     private async Task ExecuteAsync(string screen, AgentAction action)
