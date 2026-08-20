@@ -1,0 +1,12 @@
+{
+  "id": "Sts2LlmAgent",
+  "name": "STS2 LLM Agent",
+  "author": "Open source contributors",
+  "description": "Chooses legal single-player run actions through an OpenAI-compatible chat-completions API.",
+  "version": "0.1.0",
+  "has_pck": false,
+  "has_dll": true,
+  "dependencies": [],
+  "affects_gameplay": true,
+  "min_game_version": "0.107.1"
+}
