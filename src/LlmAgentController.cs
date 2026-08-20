@@ -1,4 +1,6 @@
 using System.Text.Json;
+using System.Security.Cryptography;
+using System.Text;
 using Godot;
 using MegaCrit.Sts2.Core.AutoSlay.Helpers;
 using MegaCrit.Sts2.Core.Combat;
@@ -213,8 +215,9 @@ public sealed class LlmAgentController : Node
         PlayerCombatState? pcs = player?.PlayerCombatState;
         ICombatState? combat = player?.Creature.CombatState;
         if (player is null || pcs?.Phase != PlayerTurnPhase.Play || combat is null) return null;
-        List<CombatBinding> bindings = BuildCombatBindings(player);
-        bindings.Add(new(new("end", "end_turn", "End turn"), null, null, null));
+        string actionState = CombatActionStateToken(player, combat);
+        List<CombatBinding> bindings = BuildCombatBindings(player, actionState);
+        bindings.Add(new(new($"combat:{actionState}:end", "end_turn", "End turn"), null, null, null));
         var hand = pcs.Hand.Cards.Select((card, index) => CardObservation(card, $"h{index}", PileType.Hand)).ToList();
         var potions = player.PotionSlots.Select((potion, index) => potion is null ? null : new
         {
@@ -304,7 +307,7 @@ public sealed class LlmAgentController : Node
         return new("combat", observation, bindings.Select(binding => binding.Action).ToList());
     }
 
-    private static List<CombatBinding> BuildCombatBindings(Player player)
+    private static List<CombatBinding> BuildCombatBindings(Player player, string actionState)
     {
         var bindings = new List<CombatBinding>();
         PlayerCombatState? pcs = player.PlayerCombatState;
@@ -316,14 +319,14 @@ public sealed class LlmAgentController : Node
             if (!card.CanPlay(out _, out _)) continue;
             if (card.IsValidTarget(null))
             {
-                var action = new AgentAction($"card:h{handIndex}:none", "play_card", $"Play h{handIndex} {card.Title}");
+                var action = new AgentAction($"combat:{actionState}:card:h{handIndex}:none", "play_card", $"Play h{handIndex} {card.Title}");
                 bindings.Add(new(action, card, null, null));
             }
             for (int targetIndex = 0; targetIndex < combat.Creatures.Count; targetIndex++)
             {
                 Creature target = combat.Creatures[targetIndex];
                 if (!target.IsHittable || !card.IsValidTarget(target)) continue;
-                var action = new AgentAction($"card:h{handIndex}:t{targetIndex}", "play_card", $"Play h{handIndex} {card.Title} on {target.Name}");
+                var action = new AgentAction($"combat:{actionState}:card:h{handIndex}:t{targetIndex}", "play_card", $"Play h{handIndex} {card.Title} on {target.Name}");
                 bindings.Add(new(action, card, null, target));
             }
         }
@@ -334,18 +337,27 @@ public sealed class LlmAgentController : Node
             string title = SafeText(() => potion.Title.GetFormattedText()) ?? potion.Id.Entry;
             if (potion.IsValidTarget(null))
             {
-                var action = new AgentAction($"potion:s{slotIndex}:none", "use_potion", $"Use s{slotIndex} {title}");
+                var action = new AgentAction($"combat:{actionState}:potion:s{slotIndex}:none", "use_potion", $"Use s{slotIndex} {title}");
                 bindings.Add(new(action, null, potion, null));
             }
             for (int targetIndex = 0; targetIndex < combat.Creatures.Count; targetIndex++)
             {
                 Creature target = combat.Creatures[targetIndex];
                 if (!potion.IsValidTarget(target)) continue;
-                var action = new AgentAction($"potion:s{slotIndex}:t{targetIndex}", "use_potion", $"Use s{slotIndex} {title} on {target.Name}");
+                var action = new AgentAction($"combat:{actionState}:potion:s{slotIndex}:t{targetIndex}", "use_potion", $"Use s{slotIndex} {title} on {target.Name}");
                 bindings.Add(new(action, null, potion, target));
             }
         }
         return bindings;
+    }
+
+    private static string CombatActionStateToken(Player player, ICombatState combat)
+    {
+        PlayerCombatState state = player.PlayerCombatState!;
+        string hand = string.Join(',', state.Hand.Cards.Select(card => $"{card.Id.Entry}+{card.CurrentUpgradeLevel}"));
+        string enemies = string.Join(',', combat.Creatures.Select(creature => $"{creature.CombatId}:{creature.CurrentHp}:{creature.Block}:{creature.IsAlive}"));
+        string source = $"turn={state.TurnNumber};round={combat.RoundNumber};phase={state.Phase};energy={state.Energy};stars={state.Stars};hp={player.Creature.CurrentHp};block={player.Creature.Block};hand={hand};enemies={enemies}";
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(source)))[..16];
     }
 
     private static bool CanUsePotion(Player player, PotionModel potion) =>
@@ -657,18 +669,25 @@ public sealed class LlmAgentController : Node
         RunState? run = RunManager.Instance?.DebugOnlyGetState(); if (run is null || run.Players.Count != 1) return;
         Player? player = LocalContext.GetMe(run); if (player?.PlayerCombatState?.Phase != PlayerTurnPhase.Play) return;
         ICombatState? combat = player.Creature.CombatState;
-        if (_config.Verbose && combat is not null) LogCombatState($"before {action.Id}", player, combat);
+        if (combat is null) return;
+        string currentState = CombatActionStateToken(player, combat);
+        if (!action.Id.StartsWith($"combat:{currentState}:", StringComparison.Ordinal))
+        {
+            GD.PrintErr($"[Sts2LlmAgent] discarded stale combat action {action.Id}; current turn={player.PlayerCombatState.TurnNumber} energy={player.PlayerCombatState.Energy} hand={player.PlayerCombatState.Hand.Cards.Count}");
+            return;
+        }
+        if (_config.Verbose) LogCombatState($"before {action.Id}", player, combat);
         if (action.Kind == "end_turn")
         {
             PlayerCmd.EndTurn(player, false);
-            if (_config.Verbose && combat is not null)
+            if (_config.Verbose)
             {
                 for (int frame = 0; frame < 5; frame++) await FrameAsync();
                 LogCombatState($"after {action.Id}", player, combat);
             }
             return;
         }
-        CombatBinding? binding = BuildCombatBindings(player).SingleOrDefault(candidate => candidate.Action.Id == action.Id && candidate.Action.Kind == action.Kind);
+        CombatBinding? binding = BuildCombatBindings(player, currentState).SingleOrDefault(candidate => candidate.Action.Id == action.Id && candidate.Action.Kind == action.Kind);
         if (binding?.Card is CardModel card)
         {
             using IDisposable selector = CardSelectCmd.PushSelector(new LlmCardSelector(this));
@@ -683,7 +702,7 @@ public sealed class LlmAgentController : Node
             }
         }
         else if (binding?.Potion is PotionModel potion && CanUsePotion(player, potion) && potion.IsValidTarget(binding.Target)) potion.EnqueueManualUse(binding.Target);
-        if (_config.Verbose && combat is not null)
+        if (_config.Verbose)
         {
             for (int frame = 0; frame < 5; frame++) await FrameAsync();
             LogCombatState($"after {action.Id}", player, combat);
