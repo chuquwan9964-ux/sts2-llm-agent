@@ -6,7 +6,7 @@ MODS_DIR="${STS2_MODS_DIR:-$HOME/Library/Application Support/Steam/steamapps/com
 
 dotnet build Sts2LlmAgent.csproj -c Release -p:Sts2ManagedDir="$GAME_MANAGED_DIR"
 mkdir -p "$MODS_DIR/Sts2LlmAgent"
+rm -f "$MODS_DIR/Sts2LlmAgent/Sts2LlmAgent.Core.dll"
 cp "bin/Release/net9.0/Sts2LlmAgent.dll" "$MODS_DIR/Sts2LlmAgent/"
-cp "bin/Release/net9.0/Sts2LlmAgent.Core.dll" "$MODS_DIR/Sts2LlmAgent/"
 cp Sts2LlmAgent.json "$MODS_DIR/Sts2LlmAgent/"
 printf 'Installed to %s\n' "$MODS_DIR/Sts2LlmAgent"
