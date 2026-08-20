@@ -227,6 +227,15 @@ public sealed class LlmAgentController : Node
         }).Where(potion => potion is not null).ToList();
         var observation = new
         {
+            runObjective = new
+            {
+                goal = "Survive the act, reach the act boss, and defeat the boss",
+                currentAct = run.CurrentActIndex + 1,
+                actFloor = run.ActFloor,
+                totalFloor = run.TotalFloor,
+                hpIsScarce = true,
+                normalRecovery = "Rest sites/fires are the primary HP recovery source"
+            },
             rules = new
             {
                 baseCardsDrawnAtTurnStart = 5,
@@ -291,6 +300,7 @@ public sealed class LlmAgentController : Node
                 intents = enemy.Monster?.NextMove.Intents.Select(intent => IntentObservation(intent, combat, enemy)).ToList()
             }).ToList()
         };
+        if (_config.Verbose) LogCombatState("decision", player, combat);
         return new("combat", observation, bindings.Select(binding => binding.Action).ToList());
     }
 
@@ -646,7 +656,18 @@ public sealed class LlmAgentController : Node
     {
         RunState? run = RunManager.Instance?.DebugOnlyGetState(); if (run is null || run.Players.Count != 1) return;
         Player? player = LocalContext.GetMe(run); if (player?.PlayerCombatState?.Phase != PlayerTurnPhase.Play) return;
-        if (action.Kind == "end_turn") { PlayerCmd.EndTurn(player, false); return; }
+        ICombatState? combat = player.Creature.CombatState;
+        if (_config.Verbose && combat is not null) LogCombatState($"before {action.Id}", player, combat);
+        if (action.Kind == "end_turn")
+        {
+            PlayerCmd.EndTurn(player, false);
+            if (_config.Verbose && combat is not null)
+            {
+                for (int frame = 0; frame < 5; frame++) await FrameAsync();
+                LogCombatState($"after {action.Id}", player, combat);
+            }
+            return;
+        }
         CombatBinding? binding = BuildCombatBindings(player).SingleOrDefault(candidate => candidate.Action.Id == action.Id && candidate.Action.Kind == action.Kind);
         if (binding?.Card is CardModel card)
         {
@@ -662,6 +683,19 @@ public sealed class LlmAgentController : Node
             }
         }
         else if (binding?.Potion is PotionModel potion && CanUsePotion(player, potion) && potion.IsValidTarget(binding.Target)) potion.EnqueueManualUse(binding.Target);
+        if (_config.Verbose && combat is not null)
+        {
+            for (int frame = 0; frame < 5; frame++) await FrameAsync();
+            LogCombatState($"after {action.Id}", player, combat);
+        }
+    }
+
+    private static void LogCombatState(string label, Player player, ICombatState combat)
+    {
+        PlayerCombatState state = player.PlayerCombatState!;
+        string enemies = string.Join("; ", combat.Enemies.Select((enemy, index) =>
+            $"e{index}:{enemy.Name} hp={enemy.CurrentHp}/{enemy.MaxHp} block={enemy.Block} intent={enemy.Monster?.NextMove.Intents.FirstOrDefault()?.IntentType}"));
+        GD.Print($"[Sts2LlmAgent] state {label}: player hp={player.Creature.CurrentHp}/{player.Creature.MaxHp} block={player.Creature.Block} energy={state.Energy}/{state.MaxEnergy} hand={state.Hand.Cards.Count} draw={state.DrawPile.Cards.Count} discard={state.DiscardPile.Cards.Count} exhaust={state.ExhaustPile.Cards.Count} enemies=[{enemies}]");
     }
 
     private async Task ExecuteOverlayAsync(Node overlay, AgentAction action)
