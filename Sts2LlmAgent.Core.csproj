@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Sts2LlmAgent.Core</AssemblyName>
+    <RootNamespace>Sts2LlmAgent.Core</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup><Compile Remove="tests/**/*.cs;src/LlmAgentInitializer.cs;src/LlmAgentController.cs" /></ItemGroup>
+</Project>
