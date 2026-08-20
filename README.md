@@ -59,6 +59,6 @@ dotnet run --project tests/Sts2LlmAgent.Core.Tests.csproj
 dotnet build Sts2LlmAgent.csproj -p:Sts2ManagedDir='/path/to/data_sts2_macos_arm64'
 ```
 
-游戏引用是本机专有文件，因此仓库不提供 CI build。`Sts2LlmAgent.Core` 包含无游戏依赖的环境配置、请求模型、严格 JSON 解析和 action ID 校验。
+游戏引用是本机专有文件，因此仓库不提供 CI build。`Sts2LlmAgent.Core.csproj` 只用于无游戏依赖的核心测试；发布时这些源码会编译进单一的 `Sts2LlmAgent.dll`，安装目录不需要额外的 Core DLL。
 
 Release 安装目录只需要三个文件：`Sts2LlmAgent.dll` 是 manifest 指定的主 mod，`Sts2LlmAgent.Core.dll` 是同目录的 BCL-only 依赖，`Sts2LlmAgent.json` 是 manifest。游戏专有 DLL 不复制到 mod 目录，也不进入仓库。
