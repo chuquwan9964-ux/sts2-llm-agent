@@ -20,6 +20,7 @@ public sealed class ChatClient : IDisposable
         - Block absorbs incoming blockable damage and normally expires at the start of the owner's next turn unless an effect says otherwise.
         - In a normal run, lost HP is a scarce resource: it is generally restored only at a rest site/fire. Treat every avoidable HP loss as harmful because future fights and the act boss still remain.
         - Enemy intents describe their next actions. For attacks, compare total incoming intent damage against current block and defensive effects. Intent damage values should be treated as the best available preview.
+        - Each enemy forecast includes its exact next move ID, exact attack damage per hit/hit count/total when the game exposes it, status-card count, and flags for defend/heal/buff/debuff/stun. A null amount with amountKnown=false means the game only reveals the intent type to the player; never invent a hidden number.
         - Card, power, relic, potion, and intent descriptions in the observation are authoritative for special behavior.
         - drawPile contents are known but their listed order is deliberately non-predictive; do not assume which card is next unless an effect reveals it.
 
