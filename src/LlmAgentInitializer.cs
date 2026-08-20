@@ -22,7 +22,7 @@ public static class LlmAgentInitializer
     {
         if (_attached) return;
         NGame? game = NGame.Instance;
-        if (game is null)
+        if (game is null || !game.IsInsideTree() || !game.IsNodeReady())
         {
             if (Engine.GetMainLoop() is SceneTree) Callable.From(() => AttachOrRetry(config)).CallDeferred();
             return;
@@ -30,7 +30,16 @@ public static class LlmAgentInitializer
         if (!NGame.IsMainThread()) { Callable.From(() => AttachOrRetry(config)).CallDeferred(); return; }
         _attached = true;
         LlmAgentController controller = new(config);
-        game.AddChild(controller);
-        GD.Print("[Sts2LlmAgent] controller attached");
+        Callable.From(() =>
+        {
+            if (!GodotObject.IsInstanceValid(game) || !game.IsInsideTree())
+            {
+                _attached = false;
+                AttachOrRetry(config);
+                return;
+            }
+            game.AddChild(controller);
+            GD.Print("[Sts2LlmAgent] controller attached");
+        }).CallDeferred();
     }
 }
